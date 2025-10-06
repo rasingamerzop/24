@@ -1,0 +1,733 @@
+#!/usr/bin/env bash
+# zynex_v2.sh - Upgraded menu-driven Bash tool (Version 2.1)
+# Features: Auto-update, network diagnostics, backup/restore, custom commands,
+# theme support, admin mode, safe remote script execution, logging, animated exit,
+# and ZynexFetch (fetching & cache with checksum verification).
+
+set -o errexit
+set -o pipefail
+set -o nounset
+
+# -----------------------
+# Configuration & Paths
+# -----------------------
+CONFIG_DIR="${HOME}/.zynex"
+FETCH_DIR="${CONFIG_DIR}/fetch"
+CONFIG_FILE="${CONFIG_DIR}/config"
+LOG_FILE="${CONFIG_DIR}/zynex.log"
+MENU_FILE="${PWD}/menu.txt"
+SELF_PATH="$(realpath "$0")"
+UPDATE_CHECK_URL="${UPDATE_CHECK_URL:-https://raw.githubusercontent.com/youruser/yourrepo/main/zynex_v2.sh}" # change to your raw URL
+DEFAULT_ADMIN_PW="zynex-admin"
+THEME_DEFAULT="neon"
+
+mkdir -p "${CONFIG_DIR}"
+mkdir -p "${FETCH_DIR}"
+touch "${LOG_FILE}"
+
+# -----------------------
+# Colors & Themes
+# -----------------------
+declare -A THEME_COLORS_NEON=(
+  ["RED"]="\e[31m"
+  ["GRN"]="\e[32m"
+  ["YEL"]="\e[33m"
+  ["CYN"]="\e[36m"
+  ["WHT"]="\e[97m"
+  ["BOLD"]="\e[1m"
+  ["RESET"]="\e[0m"
+)
+declare -A THEME_COLORS_DARK=(
+  ["RED"]="\e[91m"
+  ["GRN"]="\e[92m"
+  ["YEL"]="\e[93m"
+  ["CYN"]="\e[96m"
+  ["WHT"]="\e[37m"
+  ["BOLD"]="\e[1m"
+  ["RESET"]="\e[0m"
+)
+declare -A THEME_COLORS_LIGHT=(
+  ["RED"]="\e[31m"
+  ["GRN"]="\e[32m"
+  ["YEL"]="\e[33m"
+  ["CYN"]="\e[36m"
+  ["WHT"]="\e[30m"
+  ["BOLD"]="\e[1m"
+  ["RESET"]="\e[0m"
+)
+
+# load saved config or set defaults
+if [[ -f "${CONFIG_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONFIG_FILE}"
+else
+  THEME="${THEME:-$THEME_DEFAULT}"
+  ADMIN_PWHASH=""
+  cat > "${CONFIG_FILE}" <<EOF
+# ZYNEX CONFIG
+THEME="${THEME}"
+ADMIN_PWHASH="${ADMIN_PWHASH}"
+EOF
+fi
+
+apply_theme() {
+  case "${THEME}" in
+    neon) theme_map=THEME_COLORS_NEON;;
+    dark) theme_map=THEME_COLORS_DARK;;
+    light) theme_map=THEME_COLORS_LIGHT;;
+    *) theme_map=THEME_COLORS_NEON;;
+  esac
+  for k in RED GRN YEL CYN WHT BOLD RESET; do
+    declare -g "${k}"="${!theme_map[$k]}"
+  done
+}
+apply_theme
+
+log() {
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$ts] $*" | tee -a "${LOG_FILE}"
+}
+
+# -----------------------
+# Utility functions
+# -----------------------
+typewriter() {
+  local text="$1"
+  local delay="${2:-0.007}"
+  local i
+  for ((i=0; i<${#text}; i++)); do
+    printf "%s" "${text:$i:1}"
+    sleep "${delay}"
+  done
+  printf "\n"
+}
+
+prompt_confirm() {
+  # prompt_confirm "Question?"
+  local response
+  read -r -p "$1 [y/N]: " response
+  case "$response" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_command() {
+  # ensure_command curl
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo -e "${YEL}Command '$cmd' not found. Attempting to install...${RESET}"
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update && sudo apt-get install -y "$cmd"
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y "$cmd"
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y "$cmd"
+    else
+      echo -e "${RED}Automatic install not supported on this OS. Please install '$cmd' manually.${RESET}"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+hash_password() {
+  local pw="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$pw" | sha256sum | cut -d' ' -f1
+  else
+    printf '%s' "$pw" | sha1sum | cut -d' ' -f1
+  fi
+}
+
+save_config() {
+  cat > "${CONFIG_FILE}" <<EOF
+# ZYNEX CONFIG
+THEME="${THEME}"
+ADMIN_PWHASH="${ADMIN_PWHASH}"
+EOF
+  apply_theme
+}
+
+# -----------------------
+# Admin mode handling
+# -----------------------
+init_admin_if_needed() {
+  if [[ -z "${ADMIN_PWHASH:-}" ]]; then
+    log "Admin password not set. Creating default (please change)."
+    ADMIN_PWHASH="$(hash_password "${DEFAULT_ADMIN_PW}")"
+    save_config
+  fi
+}
+
+admin_login() {
+  init_admin_if_needed
+  read -r -s -p "Admin password: " pw
+  printf "\n"
+  if [[ "$(hash_password "$pw")" == "${ADMIN_PWHASH}" ]]; then
+    log "Admin login successful for user $(whoami)"
+    echo -e "${GRN}Admin mode unlocked.${RESET}"
+    return 0
+  else
+    echo -e "${RED}Wrong password.${RESET}"
+    return 1
+  fi
+}
+
+change_admin_password() {
+  echo "Change admin password"
+  read -r -s -p "New password: " p1
+  printf "\n"
+  read -r -s -p "Confirm: " p2
+  printf "\n"
+  if [[ "$p1" != "$p2" ]]; then
+    echo -e "${RED}Passwords do not match.${RESET}"
+    return 1
+  fi
+  ADMIN_PWHASH="$(hash_password "$p1")"
+  save_config
+  echo -e "${GRN}Admin password changed.${RESET}"
+}
+
+# -----------------------
+# Banner & Menu
+# -----------------------
+print_banner() {
+  clear
+  echo -e "${YEL}"
+  cat <<'EOF'
+ /$$$$$$$$       /$$     /$$       /$$   /$$       /$$$$$$$$       /$$   /$$
+|_____ $$       |  $$   /$$/      | $$$ | $$      | $$_____/      | $$  / $$
+     /$$/        \  $$ /$$/       | $$$$| $$      | $$            |  $$/ $$/
+    /$$/          \  $$$$/        | $$ $$ $$      | $$$$$          \  $$$$/ 
+   /$$/            \  $$/         | $$  $$$$      | $$__/           >$$  $$ 
+  /$$/              | $$          | $$\  $$$      | $$             /$$/\  $$
+ /$$$$$$$$          | $$          | $$ \  $$      | $$$$$$$$      | $$  \ $$
+|________/          |__/          |__/  \__/      |________/      |__/  |__/
+EOF
+  echo -e "${RESET}"
+}
+
+generate_menu_text() {
+  cat <<EOF
+${BOLD}========== MAIN MENU ==========${RESET}
+${BOLD}1. Panel (run remote panel script)${RESET}
+${BOLD}2. Wing (run remote wing script)${RESET}
+${BOLD}3. Update (run remote update script)${RESET}
+${BOLD}4. Uninstall (run remote uninstall script)${RESET}
+${BOLD}5. Blueprint (run remote blueprint script)${RESET}
+${BOLD}6. Cloudflare (run remote cloudflare script)${RESET}
+${BOLD}7. Change Theme${RESET}
+${BOLD}8. Network Diagnostics${RESET}
+${BOLD}9. Backup${RESET}
+${BOLD}10. Restore${RESET}
+${BOLD}11. Custom Commands${RESET}
+${BOLD}12. Auto-Update Check${RESET}
+${BOLD}13. Admin Mode${RESET}
+${BOLD}14. Show System Info${RESET}
+${BOLD}15. View Logs${RESET}
+${BOLD}16. Exit${RESET}
+${BOLD}17. ZynexFetch (download & cache manager)${RESET}
+${BOLD}================================${RESET}
+EOF
+}
+
+save_menu_to_file() {
+  generate_menu_text > "${MENU_FILE}"
+}
+
+# -----------------------
+# Remote script runner (safe)
+# -----------------------
+run_remote_script() {
+  # $1 = base64-encoded URL (or plain URL)
+  local encoded="$1"
+  local url
+  # try decode; if decoding fails, use raw
+  if echo "$encoded" | grep -qE '^[A-Za-z0-9+/]+=*$' && [[ $(echo "$encoded" | tr -d '\n' | wc -c) -ge 8 ]]; then
+    if url="$(echo "$encoded" | base64 -d 2>/dev/null || true)"; then
+      true
+    else
+      url="$encoded"
+    fi
+  else
+    url="$encoded"
+  fi
+
+  echo -e "${YEL}${BOLD}Planned remote execution:${RESET} ${CYN}${url}${RESET}"
+  if ! prompt_confirm "Download and inspect the script before executing?"; then
+    echo "Aborted by user."
+    return 1
+  fi
+
+  ensure_command curl || return 1
+
+  local tmp
+  tmp="$(mktemp)"
+  if curl -fsSL "$url" -o "$tmp"; then
+    echo -e "${GRN}Download successful. Saved to:${RESET} ${tmp}"
+    echo "---- begin remote script (first 200 lines preview) ----"
+    sed -n '1,200p' "$tmp"
+    echo "---- end preview ----"
+    if prompt_confirm "Do you want to run the downloaded script now?"; then
+      chmod +x "$tmp"
+      log "Executing remote script from $url"
+      bash "$tmp"
+      local rc=$?
+      rm -f "$tmp"
+      if [[ $rc -eq 0 ]]; then
+        echo -e "${GRN}Remote script executed successfully.${RESET}"
+      else
+        echo -e "${RED}Remote script exited with code $rc${RESET}"
+      fi
+      return $rc
+    else
+      echo "Execution canceled; removing temp file."
+      rm -f "$tmp"
+      return 2
+    fi
+  else
+    echo -e "${RED}Failed to download script from $url${RESET}"
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+}
+
+# -----------------------
+# Network diagnostics
+# -----------------------
+network_diagnostics() {
+  echo -e "${BOLD}Network Diagnostics${RESET}"
+  echo "Public IP:"
+  if command -v curl >/dev/null 2>&1; then
+    curl -s https://ifconfig.co || curl -s https://ipinfo.io/ip || echo "N/A"
+  else
+    echo "curl is required for public IP check."
+  fi
+  echo
+  echo "DNS resolution for google.com:"
+  if command -v dig >/dev/null 2>&1; then
+    dig +short google.com | head -n 5
+  else
+    nslookup google.com 2>/dev/null | sed -n '1,6p' || echo "dig/nslookup not available"
+  fi
+  echo
+  echo "Ping (3 packets) to 8.8.8.8:"
+  ping -c 3 8.8.8.8 || true
+  echo
+
+  if command -v speedtest >/dev/null 2>&1; then
+    echo "Running speedtest (installed)... this may take ~30s"
+    speedtest --accept-license --accept-gdpr || true
+  else
+    if prompt_confirm "Install speedtest-cli for bandwidth test (requires sudo/installer)?"; then
+      ensure_command curl || return
+      # try install official Ookla speedtest if available
+      if command -v apt-get >/dev/null 2>&1; then
+        curl -s https://install.speedtest.net/app/cli/install.deb.sh | sudo bash
+        sudo apt-get install -y speedtest
+      elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+        curl -s https://install.speedtest.net/app/cli/install.rpm.sh | sudo bash
+        sudo yum install -y speedtest || sudo dnf install -y speedtest
+      else
+        echo "Manual install required for speedtest utility."
+      fi
+    fi
+  fi
+  read -r -p "Press Enter to continue..."
+}
+
+# -----------------------
+# Backup & Restore
+# -----------------------
+backup_prompt() {
+  echo "Create backup (tar.gz)"
+  read -r -p "Enter folder(s) or file(s) to backup (space separated): " paths
+  read -r -p "Enter output filename (without ext): " fname
+  fname="${fname:-backup_$(date +%Y%m%d_%H%M%S)}"
+  out="${PWD}/${fname}.tar.gz"
+  tar -czf "$out" $paths
+  echo -e "${GRN}Backup saved to:${RESET} ${out}"
+  log "Created backup: ${out} (source: ${paths})"
+  read -r -p "Press Enter to continue..."
+}
+
+restore_prompt() {
+  echo "Restore from backup (tar.gz)"
+  read -r -p "Enter backup file path: " file
+  if [[ ! -f "$file" ]]; then
+    echo -e "${RED}File not found.${RESET}"
+    return 1
+  fi
+  echo "Listing contents:"
+  tar -tzf "$file" | sed -n '1,40p'
+  if prompt_confirm "Proceed to restore into current directory?"; then
+    tar -xzf "$file"
+    echo -e "${GRN}Restore complete.${RESET}"
+    log "Restored backup ${file} into ${PWD}"
+  else
+    echo "Restore canceled."
+  fi
+  read -r -p "Press Enter to continue..."
+}
+
+# -----------------------
+# Custom Commands
+# -----------------------
+custom_commands_menu() {
+  PS3="Choose a command to run (or 0 to go back): "
+  options=("Show nginx status" "Show ufw status" "List Docker containers" "Custom shell command" "Back")
+  select opt in "${options[@]}"; do
+    case "$REPLY" in
+      1) sudo systemctl status nginx || echo "Nginx not present"; break ;;
+      2) sudo ufw status || echo "UFW not present"; break ;;
+      3) docker ps -a || echo "Docker not present"; break ;;
+      4)
+         read -r -p "Enter command to run: " c
+         echo "Running: $c"
+         bash -c "$c" || echo "Command finished with non-zero exit"
+         break
+         ;;
+      5) break ;;
+      *) echo "Invalid";;
+    esac
+  done
+  read -r -p "Press Enter to continue..."
+}
+
+# -----------------------
+# System info & Logging
+# -----------------------
+system_info() {
+  echo -e "${BOLD}SYSTEM INFORMATION${RESET}"
+  echo "Hostname: $(hostname)"
+  echo "User: $(whoami)"
+  echo "Directory: $(pwd)"
+  echo "System: $(uname -srm)"
+  echo "Uptime: $(uptime -p)"
+  if command -v free >/dev/null 2>&1; then
+    echo "Memory: $(free -h | awk '/Mem:/ {print $3\"/\"$2}')"
+  fi
+  echo "Disk: $(df -h / | awk 'NR==2 {print $3\"/\"$2 \" (\"$5\")\"}')"
+  read -r -p "Press Enter to continue..."
+}
+
+view_logs() {
+  echo "Showing last 200 lines of ${LOG_FILE}:"
+  tail -n 200 "${LOG_FILE}" || true
+  read -r -p "Press Enter to continue..."
+}
+
+# -----------------------
+# Auto-update
+# -----------------------
+auto_update_check() {
+  ensure_command curl || return
+  if ! curl -fsSL "${UPDATE_CHECK_URL}" -o /tmp/zynex_remote.sh; then
+    echo -e "${RED}Failed to reach update URL.${RESET}"
+    rm -f /tmp/zynex_remote.sh 2>/dev/null || true
+    return 1
+  fi
+  if ! cmp -s /tmp/zynex_remote.sh "${SELF_PATH}"; then
+    echo -e "${YEL}Update available!${RESET}"
+    if prompt_confirm "Download and replace current script with latest?"; then
+      cp /tmp/zynex_remote.sh "${SELF_PATH}.bak-$(date +%s)"
+      mv /tmp/zynex_remote.sh "${SELF_PATH}"
+      chmod +x "${SELF_PATH}"
+      echo -e "${GRN}Updated script saved to ${SELF_PATH}. A backup was kept.${RESET}"
+      log "Script auto-updated from ${UPDATE_CHECK_URL}"
+      echo "Restarting..."
+      exec "${SELF_PATH}"
+    else
+      echo "Update canceled."
+      rm -f /tmp/zynex_remote.sh
+    fi
+  else
+    echo -e "${GRN}You already have the latest version.${RESET}"
+    rm -f /tmp/zynex_remote.sh
+  fi
+  read -r -p "Press Enter to continue..."
+}
+
+# -----------------------
+# Animated exit
+# -----------------------
+animated_exit() {
+  for i in {3..1}; do
+    printf "\rExiting in %d..." "$i"
+    sleep 0.6
+  done
+  printf "\r                     \r"
+  echo -e "${CYN}Goodbye!${RESET}"
+  exit 0
+}
+
+# -----------------------
+# ZynexFetch Feature (NEW)
+# -----------------------
+# Fetch files (single or batch), store in cache (~/.zynex/fetch),
+# support optional SHA256 verification, list & clear cache.
+
+zynexfetch_print_header() {
+  echo -e "${BOLD}ZynexFetch - Download & Cache Manager${RESET}"
+}
+
+zynexfetch_get_filename_from_url() {
+  local url="$1"
+  # Try to extract filename from Content-Disposition first, but fallback to basename
+  local cd
+  cd="$(curl -sI "$url" 2>/dev/null | tr -d '\r' | awk -F': ' '/[Cc]ontent-[Dd]isposition/ {print $2; exit}')"
+  if [[ -n "$cd" ]]; then
+    # content-disposition: attachment; filename="file.ext"
+    local fn
+    fn="$(echo "$cd" | sed -n 's/.*filename=["'\'']\?\([^"'\'';]*\).*/\1/p')"
+    if [[ -n "$fn" ]]; then
+      echo "$fn"
+      return 0
+    fi
+  fi
+  # fallback to URL path
+  echo "${url##*/}" | sed 's/[?].*//'
+}
+
+zynexfetch_save_metadata() {
+  local file="$1"
+  local url="$2"
+  local checksum="$3"
+  local meta="${file}.meta"
+  cat > "${meta}" <<EOF
+SOURCE=${url}
+DOWNLOADED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+SHA256=${checksum}
+EOF
+}
+
+zynexfetch_calc_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+zynexfetch_single_download() {
+  local url="$1"
+  local suggested_name
+  suggested_name="$(zynexfetch_get_filename_from_url "$url")"
+  if [[ -z "$suggested_name" ]]; then
+    suggested_name="download_$(date +%Y%m%d_%H%M%S)"
+  fi
+  echo "Detected filename: ${suggested_name}"
+  read -r -p "Save as (leave blank to accept): " fname
+  fname="${fname:-$suggested_name}"
+  local dest="${FETCH_DIR}/${fname}"
+  if [[ -f "${dest}" ]]; then
+    echo "File already exists in cache: ${dest}"
+    if prompt_confirm "Overwrite existing cached file?"; then
+      rm -f "${dest}"
+    else
+      echo "Skipping download."
+      return 0
+    fi
+  fi
+
+  echo "Downloading..."
+  ensure_command curl || return 1
+  if curl -L --progress-bar -o "${dest}" "$url"; then
+    echo -e "${GRN}Downloaded to ${dest}${RESET}"
+    # optional checksum verification
+    read -r -p "If you have a SHA256 checksum to verify, paste it now (or leave blank): " provided
+    provided="${provided//[[:space:]]/}" # trim spaces
+    local actual
+    actual="$(zynexfetch_calc_sha256 "${dest}")"
+    if [[ -n "$provided" ]]; then
+      if [[ -z "$actual" ]]; then
+        echo -e "${YEL}Checksum utility not available; skipping verification.${RESET}"
+      else
+        if [[ "${provided}" == "${actual}" ]]; then
+          echo -e "${GRN}SHA256 verified.${RESET}"
+        else
+          echo -e "${RED}SHA256 mismatch! Provided:${provided} Actual:${actual}${RESET}"
+          if ! prompt_confirm "Remove the downloaded file?"; then
+            zynexfetch_save_metadata "${dest}" "${url}" "${actual}"
+            log "Fetched but checksum mismatch: ${dest} from ${url}"
+            return 0
+          else
+            rm -f "${dest}"
+            return 2
+          fi
+        fi
+      fi
+    fi
+    # save metadata
+    zynexfetch_save_metadata "${dest}" "${url}" "${actual}"
+    log "Fetched ${dest} from ${url}"
+  else
+    echo -e "${RED}Download failed for ${url}${RESET}"
+    rm -f "${dest}" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+zynexfetch_batch_download() {
+  read -r -p "Enter path to file with URLs (one per line): " listfile
+  if [[ ! -f "$listfile" ]]; then
+    echo -e "${RED}List file not found.${RESET}"
+    return 1
+  fi
+  while IFS= read -r url; do
+    url="${url%%#*}" # remove comments after #
+    url="${url//[[:space:]]/}"
+    [[ -z "$url" ]] && continue
+    echo "----"
+    echo "Processing: $url"
+    zynexfetch_single_download "$url"
+  done < "$listfile"
+  echo "Batch complete."
+}
+
+zynexfetch_list_cache() {
+  echo -e "${BOLD}Cached files in ${FETCH_DIR}:${RESET}"
+  ls -lh "${FETCH_DIR}" | sed -n '1,200p' || echo "(empty)"
+  echo
+  read -r -p "Press Enter to continue..."
+}
+
+zynexfetch_clear_cache() {
+  echo "WARNING: This will remove all cached files and metadata in ${FETCH_DIR}."
+  if prompt_confirm "Proceed to clear cache?"; then
+    rm -rf "${FETCH_DIR}"/*
+    echo -e "${GRN}Cache cleared.${RESET}"
+    log "Cleared fetch cache"
+  else
+    echo "Canceled."
+  fi
+  read -r -p "Press Enter to continue..."
+}
+
+zynexfetch_menu() {
+  while true; do
+    zynexfetch_print_header
+    cat <<EOF
+1) Fetch single URL
+2) Batch fetch from file
+3) List cache
+4) Clear cache
+5) Back to main menu
+EOF
+    read -r -p "Choose [1-5]: " opt
+    case "$opt" in
+      1)
+        read -r -p "Enter URL to fetch: " url
+        zynexfetch_single_download "$url"
+        read -r -p "Press Enter to continue..."
+        ;;
+      2) zynexfetch_batch_download ;;
+      3) zynexfetch_list_cache ;;
+      4) zynexfetch_clear_cache ;;
+      5) break ;;
+      *) echo "Invalid option." ;;
+    esac
+  done
+}
+
+# -----------------------
+# Menu loop
+# -----------------------
+main_loop() {
+  while true; do
+    print_banner
+    save_menu_to_file
+    generate_menu_text
+    echo -ne "${BOLD}Enter choice [1-17]: ${RESET}"
+    read -r choice
+    log "User chose option: ${choice}"
+    case "${choice}" in
+      1)
+         encoded="aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0ppc2hudVRoZUdhbWVyL1Zwcy9yZWZzL2hlYWRzL21haW4vY2QvcGFuZWwuc2g="
+         run_remote_script "${encoded}"
+         ;;
+      2)
+         encoded="aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0ppc2hudVRoZUdhbWVyL1Zwcy9yZWZzL2hlYWRzL21haW4vY2Qvd2luZy5zaA=="
+         run_remote_script "${encoded}"
+         ;;
+      3)
+         encoded="aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0ppc2hudVRoZUdhbWVyL1Zwcy9yZWZzL2hlYWRzL21haW4vY2QvdXAuc2g="
+         run_remote_script "${encoded}"
+         ;;
+      4)
+         encoded="aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0ppc2hudVRoZUdhbWVyL1Zwcy9yZWZzL2hlYWRzL21haW4vY2QvdW5pbnN0YWxsbC5zaA=="
+         run_remote_script "${encoded}"
+         ;;
+      5)
+         encoded="aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0ppc2hudVRoZUdhbWVyL1Zwcy9yZWZzL2hlYWRzL21haW4vY2QvYmx1ZXByaW50LnNo"
+         run_remote_script "${encoded}"
+         ;;
+      6)
+         encoded="aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0ppc2hudVRoZUdhbWVyL1Zwcy9yZWZzL2hlYWRzL21haW4vY2QvY2xvdWRmbGFyZS5zaA=="
+         run_remote_script "${encoded}"
+         ;;
+      7)
+         echo "Available themes: neon, dark, light"
+         read -r -p "Enter theme name: " newtheme
+         case "$newtheme" in
+           neon|dark|light)
+             THEME="$newtheme"
+             save_config
+             apply_theme
+             echo -e "${GRN}Theme changed to ${THEME}.${RESET}"
+             ;;
+           *) echo "Unknown theme.";;
+         esac
+         read -r -p "Press Enter to continue..."
+         ;;
+      8) network_diagnostics ;;
+      9) backup_prompt ;;
+      10) restore_prompt ;;
+      11) custom_commands_menu ;;
+      12) auto_update_check ;;
+      13)
+         if admin_login; then
+           PS3="Admin: choose: "
+           admin_opts=("Change admin password" "View/Change update URL" "Back")
+           select aop in "${admin_opts[@]}"; do
+             case "$REPLY" in
+               1) change_admin_password; break ;;
+               2)
+                  echo "Current UPDATE_CHECK_URL: ${UPDATE_CHECK_URL}"
+                  read -r -p "Enter new update URL (or leave blank): " newu
+                  if [[ -n "$newu" ]]; then
+                    UPDATE_CHECK_URL="$newu"
+                    echo "UPDATE_CHECK_URL set to ${UPDATE_CHECK_URL}"
+                    log "UPDATE_CHECK_URL changed by admin"
+                  fi
+                  break
+                  ;;
+               3) break ;;
+               *) echo "Invalid" ;;
+             esac
+           done
+         fi
+         ;;
+      14) system_info ;;
+      15) view_logs ;;
+      16) animated_exit ;;
+      17) zynexfetch_menu ;;
+      *)
+        echo -e "${RED}${BOLD}Invalid option!${RESET}"
+        read -r -p "Press Enter to continue..."
+        ;;
+    esac
+  done
+}
+
+# -----------------------
+# Entrypoint
+# -----------------------
+init_admin_if_needed
+typewriter "${YEL}Welcome to ZYNEX v2.1 — Upgraded (zynexfetch added).${RESET}" 0.004
+main_loop
